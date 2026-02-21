@@ -16,6 +16,14 @@ from contextlib import asynccontextmanager
 from models import ModelRegistry
 from cache import IPFSCache
 
+# Per-model inference timeout in seconds.
+# DeBERTa cold-starts can be slow; these caps prevent hung requests.
+_MODEL_TIMEOUTS: Dict[str, float] = {
+    'fast': 5.0,       # MiniLM — typically 15 ms
+    'electra': 15.0,   # Electra — typically 45 ms
+    'accurate': 30.0,  # DeBERTa — typically 120 ms
+}
+
 log = structlog.get_logger()
 
 
@@ -157,8 +165,8 @@ class HybridReranker:
         }
 
     def _load_models(self):
-        """Load all registered models"""
-        for model_id in ['fast', 'accurate']:
+        """Load all registered models (fast, electra, accurate)."""
+        for model_id in ['fast', 'electra', 'accurate']:
             try:
                 model_info = self.model_registry.get_model(model_id)
 
@@ -181,6 +189,9 @@ class HybridReranker:
                     memory_mb=self._get_model_memory(model_id)
                 )
 
+            except KeyError:
+                # 'electra' may not be registered in all deployments — graceful skip
+                log.info(f"Model '{model_id}' not in registry, skipping")
             except Exception as e:
                 log.error(f"Failed to load {model_id} model", error=str(e))
 
@@ -208,91 +219,144 @@ class HybridReranker:
         content = f"{query}|{'|'.join(sorted(documents))}"
         return hashlib.sha256(content.encode()).hexdigest()
 
+    def _run_predict(self, model_id: str, pairs: list, batch_size: int) -> np.ndarray:
+        """Synchronous predict — executed inside asyncio.to_thread."""
+        with torch.cuda.amp.autocast(enabled=(self.device == 'cuda')):
+            return self.models[model_id].predict(
+                pairs, batch_size=batch_size, show_progress_bar=False
+            )
+
     async def _score_with_model(
         self,
         model_id: str,
         query: str,
         documents: List[str]
-    ) -> Tuple[np.ndarray, bool]:
-        """Score documents with a specific model"""
+    ) -> Tuple[Optional[np.ndarray], bool]:
+        """
+        Score documents with a specific model.
+
+        Runs inference in a thread pool so the FastAPI event loop isn't
+        blocked.  Each model has a hard timeout (see _MODEL_TIMEOUTS); a
+        TimeoutError results in (None, False) so callers can fall back.
+        """
         pairs = [[query, doc] for doc in documents]
+        timeout = _MODEL_TIMEOUTS.get(model_id, 30.0)
 
         try:
-            # Adaptive batching
             batch_size = self.batcher.size
-
-            with torch.cuda.amp.autocast(enabled=(self.device == 'cuda')):
-                scores = self.models[model_id].predict(
-                    pairs,
-                    batch_size=batch_size,
-                    show_progress_bar=False
-                )
-
+            scores = await asyncio.wait_for(
+                asyncio.to_thread(self._run_predict, model_id, pairs, batch_size),
+                timeout=timeout,
+            )
             self.batcher.adjust(success=True)
-            return scores, True
+            return np.array(scores), True
+
+        except asyncio.TimeoutError:
+            log.warning(
+                "Model inference timed out",
+                model=model_id,
+                timeout_s=timeout,
+            )
+            return None, False
 
         except RuntimeError as e:
             if 'out of memory' in str(e).lower():
-                # OOM - retry with smaller batch
                 torch.cuda.empty_cache()
                 self.batcher.adjust(success=False)
-
                 log.warning(
-                    "OOM during inference, retrying",
+                    "OOM during inference, retrying with smaller batch",
                     model=model_id,
-                    new_batch_size=self.batcher.size
+                    new_batch_size=self.batcher.size,
                 )
-
-                # Retry
-                scores = self.models[model_id].predict(
-                    pairs,
-                    batch_size=self.batcher.size,
-                    show_progress_bar=False
-                )
-                return scores, True
+                try:
+                    scores = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._run_predict, model_id, pairs, self.batcher.size
+                        ),
+                        timeout=timeout,
+                    )
+                    return np.array(scores), True
+                except asyncio.TimeoutError:
+                    log.warning("OOM retry also timed out", model=model_id)
+                    return None, False
             else:
                 raise
 
     def _compute_confidence(self, scores: np.ndarray) -> float:
         """
-        Compute confidence metric:
-        - High variance in scores = high confidence in top results
-        - Low variance = uncertain, need better model
+        Compute confidence metric using score gap as primary signal.
+
+        - gap: difference between top-1 and top-2 scores — high gap means
+          the best document is clearly ahead of the rest (reliable ranking).
+        - top_score: absolute quality of the best match.
+        - variance: spread across all scores — high variance means the model
+          has strong opinions about ordering.
+
+        All three components are bounded in [0, 1].
         """
         if len(scores) < 2:
             return 1.0
 
-        # Normalize scores
-        norm_scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
+        sorted_scores = np.sort(scores)[::-1]
 
-        # Confidence = variance + max score
-        variance = np.var(norm_scores)
-        max_score = norm_scores.max()
+        # Gap between top-1 and top-2 (primary signal of clarity)
+        gap = float(sorted_scores[0] - sorted_scores[1])
 
-        # Weighted combination
-        confidence = 0.7 * max_score + 0.3 * variance
+        # Absolute top score (quality anchor)
+        score_range = float(sorted_scores[0] - sorted_scores[-1] + 1e-8)
+        norm_top = float(sorted_scores[0] - sorted_scores[-1]) / score_range  # 1.0 always if 1 doc
+        norm_gap = min(gap / score_range, 1.0)
 
-        return float(np.clip(confidence, 0, 1))
+        # Variance (discriminative power across docs)
+        variance = float(np.var(sorted_scores))
+        norm_variance = min(variance / (score_range ** 2 + 1e-8), 1.0)
+
+        confidence = 0.5 * norm_gap + 0.3 * norm_top + 0.2 * norm_variance
+        return float(np.clip(confidence, 0.0, 1.0))
 
     async def _cloud_rerank(
         self,
         query: str,
         documents: List[str]
     ) -> Optional[np.ndarray]:
-        """Fallback to GCP Vertex AI"""
+        """
+        Fallback to GCP Vertex AI text-embedding-004 for cloud-tier reranking.
 
+        Uses bi-encoder cosine similarity (embed query + each doc, then dot-product)
+        as a proxy for cross-encoder relevance.  Requires GOOGLE_CLOUD_PROJECT to
+        be set and Application Default Credentials to be configured.
+        """
         if not self.cloud_breaker.can_attempt():
             log.warning("Circuit breaker open, skipping cloud")
             return None
 
         try:
-            from google.cloud import aiplatform
+            import vertexai
+            from vertexai.language_models import TextEmbeddingModel
 
-            # TODO: Implement Vertex AI reranking
-            # This is a placeholder - you'll need to configure your endpoint
+            vertexai.init()  # reads GOOGLE_CLOUD_PROJECT + ADC from environment
+            model = TextEmbeddingModel.from_pretrained("text-embedding-004")
 
-            log.info("Cloud reranking not implemented yet")
-            return None
+            # Embed query + all documents in one batch call
+            all_texts = [query] + documents
+            embeddings = await asyncio.to_thread(model.get_embeddings, all_texts)
+
+            query_vec = np.array(embeddings[0].values, dtype=np.float32)
+            query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+
+            scores: List[float] = []
+            for emb in embeddings[1:]:
+                doc_vec = np.array(emb.values, dtype=np.float32)
+                doc_norm = doc_vec / (np.linalg.norm(doc_vec) + 1e-8)
+                scores.append(float(np.dot(query_norm, doc_norm)))
+
+            self.cloud_breaker.record_success()
+            log.info(
+                "Cloud reranking completed",
+                model="text-embedding-004",
+                doc_count=len(documents),
+            )
+            return np.array(scores, dtype=np.float32)
 
         except Exception as e:
             log.error("Cloud rerank failed", error=str(e))
@@ -330,12 +394,16 @@ class HybridReranker:
         # Rerank based on mode
         if mode == 'fast':
             scores, success = await self._score_with_model('fast', query, documents)
+            if scores is None:
+                scores = np.zeros(len(documents))
             model_used = 'fast'
             confidence = self._compute_confidence(scores)
             self.stats['fast_model'] += 1
 
         elif mode == 'accurate':
             scores, success = await self._score_with_model('accurate', query, documents)
+            if scores is None:
+                scores = np.zeros(len(documents))
             model_used = 'accurate'
             confidence = self._compute_confidence(scores)
             self.stats['accurate_model'] += 1
@@ -344,38 +412,79 @@ class HybridReranker:
             scores = await self._cloud_rerank(query, documents)
             if scores is None:
                 # Fallback to accurate
-                scores, success = await self._score_with_model('accurate', query, documents)
+                scores, _ = await self._score_with_model('accurate', query, documents)
+                if scores is None:
+                    scores = np.zeros(len(documents))
                 model_used = 'accurate_fallback'
             else:
                 model_used = 'cloud'
             confidence = 1.0
             self.stats['cloud_fallback'] += 1
 
-        else:  # auto
-            # Step 1: Fast model
+        else:  # auto — 3-tier cascade: fast → electra → accurate
+            HIGH_CONF = self.confidence_threshold  # default 0.80
+            MID_CONF = 0.60
+
+            # Tier 1: MiniLM (fast)
             scores, success = await self._score_with_model('fast', query, documents)
+            if scores is None:  # timeout
+                scores = np.zeros(len(documents))
             confidence = self._compute_confidence(scores)
 
-            # Step 2: Check confidence
-            if confidence >= self.confidence_threshold:
-                # High confidence - use fast result
+            if confidence >= HIGH_CONF:
                 model_used = 'fast'
                 self.stats['fast_model'] += 1
+                log.debug("Fast model sufficient", confidence=confidence)
+
+            elif 'electra' in self.models:
+                # Tier 2: Electra (medium accuracy, ~45 ms)
                 log.debug(
-                    "Fast model sufficient",
-                    confidence=confidence,
-                    threshold=self.confidence_threshold
+                    "Escalating to Electra",
+                    fast_confidence=confidence,
                 )
+                electra_scores, electra_ok = await self._score_with_model(
+                    'electra', query, documents
+                )
+                if electra_scores is not None:
+                    scores = electra_scores
+                    confidence = self._compute_confidence(scores)
+                    model_used = 'electra'
+                    self.stats['accurate_model'] += 1  # bucket as accurate
+
+                    if confidence >= MID_CONF:
+                        log.debug("Electra model sufficient", confidence=confidence)
+                    else:
+                        # Tier 3: DeBERTa (highest accuracy, ~120 ms)
+                        log.debug("Escalating to DeBERTa", electra_confidence=confidence)
+                        accurate_scores, _ = await self._score_with_model(
+                            'accurate', query, documents
+                        )
+                        if accurate_scores is not None:
+                            scores = accurate_scores
+                            confidence = self._compute_confidence(scores)
+                            model_used = 'accurate'
+                else:
+                    # Electra timed out — fall through to accurate
+                    model_used = 'electra_timeout'
+                    accurate_scores, _ = await self._score_with_model('accurate', query, documents)
+                    if accurate_scores is not None:
+                        scores = accurate_scores
+                        confidence = self._compute_confidence(scores)
+                        model_used = 'accurate'
             else:
-                # Low confidence - use accurate model
+                # No Electra — go straight to accurate
                 log.debug(
-                    "Low confidence, using accurate model",
+                    "Low confidence, escalating to accurate model",
                     confidence=confidence,
-                    threshold=self.confidence_threshold
                 )
-                scores, success = await self._score_with_model('accurate', query, documents)
-                confidence = self._compute_confidence(scores)
-                model_used = 'accurate'
+                accurate_scores, _ = await self._score_with_model('accurate', query, documents)
+                if accurate_scores is not None:
+                    scores = accurate_scores
+                    confidence = self._compute_confidence(scores)
+                    model_used = 'accurate'
+                else:
+                    # Accurate model timed out; keep fast scores as best available
+                    model_used = 'fast'
                 self.stats['accurate_model'] += 1
 
         # Sort and truncate

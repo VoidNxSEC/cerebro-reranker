@@ -6,8 +6,8 @@ For production deployment
 
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from optimum.onnxruntime import ORTModelForSequenceClassification
-from optimum.onnxruntime.configuration import OptimizationConfig, AutoQuantizationConfig
+from optimum.onnxruntime import ORTModelForSequenceClassification, ORTQuantizer
+from optimum.onnxruntime.configuration import OptimizationConfig, AutoQuantizationConfig, QuantizationConfig
 import ipfshttpclient
 import structlog
 from pathlib import Path

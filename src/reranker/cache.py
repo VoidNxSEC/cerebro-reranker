@@ -3,12 +3,13 @@ IPFS-backed Redis Cache
 Persistent caching with distributed storage
 """
 
+import hashlib
 import json
-import redis
-import ipfshttpclient
 from typing import Optional, Dict, Any
+
+import redis.asyncio as aioredis
+import ipfshttpclient
 import structlog
-from datetime import timedelta
 
 log = structlog.get_logger()
 
@@ -16,7 +17,7 @@ log = structlog.get_logger()
 class IPFSCache:
     """
     Two-tier cache:
-    1. Redis for hot data (fast)
+    1. Redis for hot data (fast, async-safe)
     2. IPFS for cold data (persistent, distributed)
     """
 
@@ -29,17 +30,9 @@ class IPFSCache:
         self.redis_url = redis_url
         self.ipfs_api = ipfs_api
         self.ttl = ttl
+        self._redis: Optional[aioredis.Redis] = None
 
-        # Connect to Redis
-        try:
-            self.redis = redis.from_url(redis_url, decode_responses=True)
-            self.redis.ping()
-            log.info("Redis connected", url=redis_url)
-        except Exception as e:
-            log.error("Redis connection failed", error=str(e))
-            self.redis = None
-
-        # Connect to IPFS
+        # Connect to IPFS (sync client — IPFS operations are fine blocking)
         try:
             self.ipfs = ipfshttpclient.connect(ipfs_api)
             log.info("IPFS connected", api=ipfs_api)
@@ -47,40 +40,46 @@ class IPFSCache:
             log.warning("IPFS connection failed", error=str(e))
             self.ipfs = None
 
+    async def _get_redis(self) -> Optional[aioredis.Redis]:
+        """Lazily create and verify the async Redis connection."""
+        if self._redis is None:
+            try:
+                self._redis = aioredis.from_url(
+                    self.redis_url, decode_responses=True
+                )
+                await self._redis.ping()
+                log.info("Redis connected", url=self.redis_url)
+            except Exception as e:
+                log.error("Redis connection failed", error=str(e))
+                self._redis = None
+        return self._redis
+
     def is_connected(self) -> bool:
-        """Check if both Redis and IPFS are connected"""
-        redis_ok = self.redis is not None and self.redis.ping()
-        ipfs_ok = self.ipfs is not None
-        return redis_ok and ipfs_ok
+        """Non-blocking check: True if the async client was successfully created."""
+        return self._redis is not None
 
     async def get(self, key: str) -> Optional[Dict]:
-        """Get cached result"""
-        if not self.redis:
+        """Get cached result (async-safe)."""
+        redis = await self._get_redis()
+        if not redis:
             return None
 
         try:
-            # Check Redis first (hot cache)
-            cached = self.redis.get(f"rerank:{key}")
-
+            # Hot cache: Redis
+            cached = await redis.get(f"rerank:{key}")
             if cached:
                 log.debug("Cache hit (Redis)", key=key[:16])
                 return json.loads(cached)
 
-            # Check IPFS (cold cache)
-            ipfs_key = f"rerank:ipfs:{key}"
-            ipfs_cid = self.redis.get(ipfs_key)
-
+            # Cold cache: IPFS
+            ipfs_cid = await redis.get(f"rerank:ipfs:{key}")
             if ipfs_cid and self.ipfs:
                 try:
                     data = self.ipfs.cat(ipfs_cid)
                     result = json.loads(data)
 
                     # Warm up Redis
-                    self.redis.setex(
-                        f"rerank:{key}",
-                        self.ttl,
-                        json.dumps(result)
-                    )
+                    await redis.setex(f"rerank:{key}", self.ttl, json.dumps(result))
 
                     log.debug("Cache hit (IPFS)", key=key[:16], cid=ipfs_cid)
                     return result
@@ -95,42 +94,30 @@ class IPFSCache:
             return None
 
     async def set(self, key: str, value: Dict) -> Optional[str]:
-        """Set cached result and return IPFS CID"""
-        if not self.redis:
+        """Set cached result and return IPFS CID (async-safe)."""
+        redis = await self._get_redis()
+        if not redis:
             return None
 
         try:
             serialized = json.dumps(value)
 
-            # Set in Redis (hot cache)
-            self.redis.setex(
-                f"rerank:{key}",
-                self.ttl,
-                serialized
-            )
+            # Hot cache: Redis
+            await redis.setex(f"rerank:{key}", self.ttl, serialized)
 
-            # Pin to IPFS (cold cache)
+            # Cold cache: IPFS
             ipfs_cid = None
             if self.ipfs:
                 try:
-                    result = self.ipfs.add_json(value)
-                    ipfs_cid = result
+                    ipfs_cid = self.ipfs.add_json(value)
 
-                    # Store CID reference
-                    self.redis.setex(
-                        f"rerank:ipfs:{key}",
-                        self.ttl * 24,  # Keep CID longer
-                        ipfs_cid
-                    )
+                    # Store CID reference with extended TTL
+                    await redis.setex(f"rerank:ipfs:{key}", self.ttl * 24, ipfs_cid)
 
                     # Pin permanently
                     self.ipfs.pin.add(ipfs_cid)
 
-                    log.debug(
-                        "Cached to IPFS",
-                        key=key[:16],
-                        cid=ipfs_cid
-                    )
+                    log.debug("Cached to IPFS", key=key[:16], cid=ipfs_cid)
 
                 except Exception as e:
                     log.warning("IPFS pin failed", error=str(e))
@@ -141,18 +128,19 @@ class IPFSCache:
             log.error("Cache set failed", error=str(e))
             return None
 
-    def size(self) -> int:
-        """Get cache size (number of keys)"""
-        if not self.redis:
+    async def size(self) -> int:
+        """Get number of Redis keys (async-safe)."""
+        redis = await self._get_redis()
+        if not redis:
             return 0
-
         try:
-            return self.redis.dbsize()
-        except:
+            return await redis.dbsize()
+        except Exception:
             return 0
 
-    def clear(self):
-        """Clear all cache"""
-        if self.redis:
-            self.redis.flushdb()
+    async def clear(self) -> None:
+        """Clear all Redis keys (async-safe)."""
+        redis = await self._get_redis()
+        if redis:
+            await redis.flushdb()
             log.info("Cache cleared")
