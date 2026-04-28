@@ -68,7 +68,7 @@
             onnxruntime
             redis
             ipfshttpclient
-            google-cloud-aiplatform
+            #google-cloud-aiplatform
             psycopg2
             pydantic
             prometheus-client
